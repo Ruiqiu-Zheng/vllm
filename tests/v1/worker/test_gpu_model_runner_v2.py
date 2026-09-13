@@ -4,10 +4,12 @@
 import contextlib
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.lora.request import LoRARequest
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -17,6 +19,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 
@@ -295,3 +298,188 @@ def test_capture_model_profile_only_skips_lock(monkeypatch):
     runner.capture_model(profile_only=True)
 
     assert lock_calls == []
+
+
+def test_lora_state_reuses_supplied_active_requests_without_recomputing(
+    monkeypatch,
+) -> None:
+    lora_state = LoraState(max_num_reqs=4)
+    shared_lora = LoRARequest("shared", 11, "/tmp/shared")
+    other_lora = LoRARequest("other", 23, "/tmp/other")
+    old_active_requests = {shared_lora, other_lora}
+
+    lora_state.add_request("req-b", 0, shared_lora)
+    lora_state.add_request("req-c", 1, shared_lora)
+    lora_state.add_request("req-a", 2, other_lora)
+    lora_state.add_request("base", 3, None)
+
+    def fail_get_activate_loras(req_ids):
+        pytest.fail(f"recomputed active LoRAs for {req_ids}")
+
+    monkeypatch.setattr(lora_state, "get_activate_loras", fail_get_activate_loras)
+
+    prompt_mapping, token_mapping, active_requests = lora_state.make_lora_inputs(
+        ["base", "req-a", "req-b", "req-c"],
+        np.array([3, 2, 0, 1], dtype=np.int32),
+        np.array([1, 2, 3, 4], dtype=np.int32),
+        active_lora_requests=old_active_requests,
+    )
+
+    assert active_requests is old_active_requests
+    assert prompt_mapping == (0, 23, 11, 11)
+    assert token_mapping == (0, 23, 23, 11, 11, 11, 11, 11, 11, 11)
+
+
+def test_lora_state_make_lora_inputs_fallback_computes_active_requests() -> None:
+    lora_state = LoraState(max_num_reqs=2)
+    lora_request = LoRARequest("active", 7, "/tmp/active")
+    lora_state.add_request("req-active", 0, lora_request)
+    lora_state.add_request("base", 1, None)
+
+    prompt_mapping, token_mapping, active_requests = lora_state.make_lora_inputs(
+        ["base", "req-active"],
+        np.array([1, 0], dtype=np.int32),
+        np.array([1, 2], dtype=np.int32),
+    )
+
+    assert active_requests == {lora_request}
+    assert prompt_mapping == (0, 7)
+    assert token_mapping == (0, 7, 7)
+
+
+class _CountingLoraState(LoraState):
+    def __init__(
+        self,
+        max_num_reqs: int,
+        active_lora_requests: set[LoRARequest],
+    ) -> None:
+        super().__init__(max_num_reqs)
+        self.active_lora_requests = active_lora_requests
+        self.seen_req_ids: list[list[str]] = []
+
+    def get_activate_loras(self, req_ids: list[str]) -> set[LoRARequest]:
+        self.seen_req_ids.append(req_ids)
+        return self.active_lora_requests
+
+
+class _LoraActivationDone(Exception):
+    pass
+
+
+def test_mrv2_execute_model_reuses_one_active_lora_set_for_dispatch_and_activation(
+    monkeypatch,
+) -> None:
+    shared_lora = LoRARequest("shared", 11, "/tmp/shared")
+    other_lora = LoRARequest("other", 23, "/tmp/other")
+    active_lora_requests = {shared_lora, other_lora}
+    lora_state = _CountingLoraState(
+        max_num_reqs=4,
+        active_lora_requests=active_lora_requests,
+    )
+    lora_state.add_request("req-b", 0, shared_lora)
+    lora_state.add_request("req-c", 1, shared_lora)
+    lora_state.add_request("req-a", 2, other_lora)
+    lora_state.add_request("base", 3, None)
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.update_pp_decode_requests = lambda: None
+    runner.finish_requests = lambda _scheduler_output: None
+    runner.free_states = lambda _scheduler_output: None
+    runner.add_requests = lambda _scheduler_output: None
+    runner.update_requests = lambda _scheduler_output: None
+    runner.block_tables = SimpleNamespace(apply_staged_writes=lambda: None)
+    runner.gather_batch_req_state = lambda _scheduler_output, _dummy_run: (
+        SimpleNamespace(num_tokens=10),
+        0,
+    )
+    runner.pcp_manager = None
+    runner.lora_config = SimpleNamespace()
+    runner.lora_state = lora_state
+    runner.is_encoder_decoder = False
+    runner.cudagraph_manager = object()
+    runner.dp_size = 1
+    runner.dp_rank = 0
+    runner.parallel_config = SimpleNamespace()
+    runner.ubatch_runner = None
+    runner.decode_query_len = 1
+    runner.observability_config = SimpleNamespace(cudagraph_metrics=False)
+    runner.prepare_inputs = lambda *_args: SimpleNamespace(
+        req_ids=["base", "req-a", "req-b", "req-c"],
+        idx_mapping_np=np.array([3, 2, 0, 1], dtype=np.int32),
+        num_scheduled_tokens=np.array([1, 2, 3, 4], dtype=np.int32),
+    )
+    runner.prepare_attn = lambda _input_batch: (object(), object())
+    runner.kv_cache_config = SimpleNamespace()
+    runner.req_states = SimpleNamespace(num_computed_tokens=SimpleNamespace(gpu=None))
+    runner.model_state = SimpleNamespace(preprocess_state=lambda *_args: None)
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={
+            "req-b": 3,
+            "req-c": 4,
+            "req-a": 2,
+            "base": 1,
+        },
+        total_num_scheduled_tokens=10,
+        scheduled_encoder_inputs={},
+    )
+    dispatch_kwargs = {}
+
+    def fake_dispatch(*_args, **kwargs):
+        dispatch_kwargs.update(kwargs)
+        return SimpleNamespace(num_tokens=10, num_reqs=4, num_ubatches=1), None
+
+    def fake_set_active_loras(prompt_mapping, token_mapping, active_requests):
+        assert prompt_mapping == (0, 23, 11, 11)
+        assert token_mapping == (0, 23, 23, 11, 11, 11, 11, 11, 11, 11)
+        assert active_requests is active_lora_requests
+        raise _LoraActivationDone
+
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", fake_dispatch)
+    runner._set_active_loras = fake_set_active_loras
+
+    with pytest.raises(_LoraActivationDone):
+        runner.execute_model(scheduler_output)
+
+    assert dispatch_kwargs["num_active_loras"] == len(active_lora_requests)
+    assert lora_state.seen_req_ids == [["req-b", "req-c", "req-a", "base"]]
+
+
+def test_mrv2_dummy_lora_dispatch_uses_max_loras_plus_one(monkeypatch) -> None:
+    active_lora_requests: set[LoRARequest] = set()
+    lora_state = _CountingLoraState(
+        max_num_reqs=1,
+        active_lora_requests=active_lora_requests,
+    )
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.gather_batch_req_state = lambda _scheduler_output, _dummy_run: (None, 0)
+    runner.pcp_manager = None
+    runner.lora_config = SimpleNamespace(max_loras=4)
+    runner.lora_state = lora_state
+    runner.is_encoder_decoder = False
+    runner.cudagraph_manager = object()
+    runner.dp_size = 1
+    runner.dp_rank = 0
+    runner.parallel_config = SimpleNamespace()
+    runner.ubatch_runner = None
+    runner.decode_query_len = 1
+    runner.kv_connector = SimpleNamespace(no_forward=lambda _scheduler_output: object())
+    runner._merge_ec_connector_no_forward = lambda _scheduler_output, output: output
+
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"_dummy_req_0": 3},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+    )
+    dispatch_kwargs = {}
+
+    def fake_dispatch(*_args, **kwargs):
+        dispatch_kwargs.update(kwargs)
+        return SimpleNamespace(num_tokens=0), None
+
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", fake_dispatch)
+
+    runner.execute_model(scheduler_output, dummy_run=True)
+
+    assert dispatch_kwargs["num_active_loras"] == 5
+    assert lora_state.seen_req_ids == []

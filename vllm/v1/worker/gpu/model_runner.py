@@ -1609,11 +1609,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         num_active_loras = 0
+        active_lora_requests = None
         if self.lora_config:
             req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-            num_active_loras = get_num_active_loras_for_dispatch(
-                self.lora_config, self.lora_state, req_ids, dummy_run
-            )
+            if dummy_run:
+                num_active_loras = get_num_active_loras_for_dispatch(
+                    self.lora_config, self.lora_state, req_ids, dummy_run
+                )
+            else:
+                active_lora_requests = self.lora_state.get_activate_loras(req_ids)
+                num_active_loras = len(active_lora_requests)
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1672,6 +1677,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.req_ids,
                     input_batch.idx_mapping_np,
                     input_batch.num_scheduled_tokens,
+                    active_lora_requests=active_lora_requests,
                 )
                 self._set_active_loras(*lora_inputs)
         else:

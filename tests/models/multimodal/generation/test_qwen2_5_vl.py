@@ -1,11 +1,32 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import importlib.machinery
+import importlib.util
+import sys
+import types
+
 import pytest
+import torch
+
+if importlib.util.find_spec("torchvision") is None:
+    for _name in (
+        "torchvision",
+        "torchvision.transforms",
+        "torchvision.transforms.v2",
+        "torchvision.transforms.v2.functional",
+    ):
+        _module = types.ModuleType(_name)
+        _module.__spec__ = importlib.machinery.ModuleSpec(_name, loader=None)
+        sys.modules[_name] = _module
 
 from vllm.assets.image import ImageAsset
+from vllm.model_executor.models.qwen2_5_vl import (
+    Qwen2_5_VLForConditionalGeneration,
+)
 from vllm.multimodal.video import sample_frames_from_video
 from vllm.platforms import current_platform
+from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from ....conftest import VIDEO_ASSETS
 
@@ -49,6 +70,88 @@ def _encoder_cudagraph_config(*, max_vision_items: int) -> dict:
         "cudagraph_mm_encoder": True,
         "encoder_cudagraph_max_vision_items_per_batch": max_vision_items,
     }
+
+
+class _TensorSubclass(torch.Tensor):
+    pass
+
+
+_SELECTOR_GRID = [[1, 2, 2], [1, 2, 4], [1, 4, 4]]
+_PATCH_OFFSETS = [0, 4, 12, 28]
+
+
+def _selector_pixel_values(cols: int = 3) -> torch.Tensor:
+    return torch.arange(28 * cols, dtype=torch.float32).reshape(28, cols)
+
+
+def _item_slice(pixel_values: torch.Tensor, index: int) -> torch.Tensor:
+    return pixel_values[_PATCH_OFFSETS[index] : _PATCH_OFFSETS[index + 1]]
+
+
+def _ptr(tensor: torch.Tensor) -> int:
+    return tensor.untyped_storage().data_ptr()
+
+
+def _select_items(pixel_values, indices, *, modality="image"):
+    selected_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+    grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
+    mm_kwargs = {selected_key: pixel_values, grid_key: _SELECTOR_GRID}
+    model = object.__new__(Qwen2_5_VLForConditionalGeneration)
+    result = model.select_encoder_cudagraph_items(mm_kwargs, indices)
+    return result, result[selected_key], grid_key
+
+
+@pytest.mark.parametrize(
+    "modality, indices, guard, aliases",
+    [
+        ("image", [0], None, True),
+        ("video", [1], None, True),
+        ("image", [0, 1], None, False),
+        ("image", [2, 0], None, False),
+        ("image", [1, 1], None, False),
+        ("image", [0], "noncontiguous", False),
+        ("image", [0], "requires_grad", False),
+        ("image", [0], "subclass", False),
+    ],
+)
+def test_qwen2_5_vl_select_encoder_cudagraph_selection(
+    modality, indices, guard, aliases
+):
+    pixel_values = _selector_pixel_values()
+    if guard == "noncontiguous":
+        pixel_values = _selector_pixel_values(cols=6)[:, ::2]
+    elif guard == "requires_grad":
+        pixel_values.requires_grad_()
+    elif guard == "subclass":
+        pixel_values = pixel_values.as_subclass(_TensorSubclass)
+
+    result, selected, grid_key = _select_items(pixel_values, indices, modality=modality)
+    expected = torch.cat([_item_slice(pixel_values, i) for i in indices])
+
+    assert torch.equal(selected, expected)
+    assert (_ptr(selected) == _ptr(pixel_values)) is aliases
+    if aliases:
+        assert (
+            selected.storage_offset()
+            == _item_slice(pixel_values, indices[0]).storage_offset()
+        )
+    else:
+        assert selected.is_contiguous()
+    assert selected.requires_grad is pixel_values.requires_grad
+    assert result[grid_key] == [_SELECTOR_GRID[i] for i in indices]
+
+
+def test_qwen2_5_vl_select_encoder_cudagraph_padded_copy_is_independent():
+    pixel_values = _selector_pixel_values()
+    _, selected, _ = _select_items(pixel_values, [0])
+    expected = selected.clone()
+    dst = torch.empty(selected.shape[0] + 2, selected.shape[1])
+
+    EncoderCudaGraphManager._copy_padded_buffer(dst, selected)
+    pixel_values.add_(1000)
+
+    assert torch.equal(dst[: selected.shape[0]], expected)
+    assert not dst[selected.shape[0] :].any()
 
 
 @pytest.mark.core_model

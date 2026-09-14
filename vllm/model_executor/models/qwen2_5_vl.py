@@ -1830,9 +1830,20 @@ class Qwen2_5_VLForConditionalGeneration(
         for p in patches_per_item:
             cum_patches.append(cum_patches[-1] + p)
 
-        selected_pv = torch.cat(
-            [pixel_values[cum_patches[i] : cum_patches[i + 1]] for i in indices]
-        )
+        pixel_slices = [
+            pixel_values[cum_patches[i] : cum_patches[i + 1]] for i in indices
+        ]
+        if (
+            len(pixel_slices) == 1
+            and type(pixel_slices[0]) is torch.Tensor
+            and pixel_slices[0].layout == torch.strided
+            and pixel_slices[0].numel() > 0
+            and pixel_slices[0].is_contiguous()
+            and not pixel_slices[0].requires_grad
+        ):
+            selected_pv = pixel_slices[0]
+        else:
+            selected_pv = torch.cat(pixel_slices)
         selected_grid = [grid_thw[i] for i in indices]
 
         if self.get_input_modality(mm_kwargs) == "image":

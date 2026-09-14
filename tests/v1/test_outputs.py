@@ -7,12 +7,14 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     ECConnectorOutput,
     LogprobsLists,
     LogprobsTensors,
     ModelRunnerOutput,
+    make_empty_encoder_model_runner_output,
 )
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.sample.output import SamplingMaskTensors
@@ -258,3 +260,91 @@ def test_with_ec_conn_output_copies_shared_empty_output():
     assert result is not EMPTY_MODEL_RUNNER_OUTPUT
     assert result.ec_connector_output is ec_output
     assert EMPTY_MODEL_RUNNER_OUTPUT.ec_connector_output is None
+
+
+def _make_scheduler_output(
+    num_scheduled_tokens: dict[str, int],
+) -> SchedulerOutput:
+    return SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens=num_scheduled_tokens,
+        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def test_empty_encoder_model_runner_output_reuses_shared_empty_output():
+    result = make_empty_encoder_model_runner_output(_make_scheduler_output({}))
+
+    assert result is EMPTY_MODEL_RUNNER_OUTPUT
+
+
+def test_empty_encoder_model_runner_output_preserves_single_request_mapping():
+    result = make_empty_encoder_model_runner_output(
+        _make_scheduler_output({"req-single": 3})
+    )
+
+    assert result.req_ids == ["req-single"]
+    assert result.req_id_to_index == {"req-single": 0}
+
+
+def test_empty_encoder_model_runner_output_preserves_scheduled_request_order():
+    scheduled_tokens = {"req-z": 2, "req-a": 4, "req-m": 1}
+
+    result = make_empty_encoder_model_runner_output(
+        _make_scheduler_output(scheduled_tokens)
+    )
+
+    assert result.req_ids == ["req-z", "req-a", "req-m"]
+    assert result.req_id_to_index == {"req-z": 0, "req-a": 1, "req-m": 2}
+
+
+def test_empty_encoder_model_runner_output_has_no_generated_data():
+    result = make_empty_encoder_model_runner_output(_make_scheduler_output({"req": 5}))
+
+    assert result.sampled_token_ids == []
+    assert result.logprobs is None
+    assert result.prompt_logprobs_dict == {}
+    assert result.pooler_output is None
+    assert result.kv_connector_output is None
+    assert result.ec_connector_output is None
+    assert result.num_nans_in_logits is None
+    assert result.cudagraph_stats is None
+    assert result.routed_experts is None
+    assert result.sampling_masks is None
+
+
+def test_empty_encoder_model_runner_output_uses_fresh_token_lists():
+    first = make_empty_encoder_model_runner_output(_make_scheduler_output({"a": 1}))
+    second = make_empty_encoder_model_runner_output(_make_scheduler_output({"b": 1}))
+
+    assert first is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert second is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert first.sampled_token_ids is not second.sampled_token_ids
+    assert first.sampled_token_ids is not EMPTY_MODEL_RUNNER_OUTPUT.sampled_token_ids
+
+    first.sampled_token_ids.append([42])
+
+    assert second.sampled_token_ids == []
+    assert EMPTY_MODEL_RUNNER_OUTPUT.sampled_token_ids == []
+
+
+def test_empty_encoder_model_runner_output_carries_ec_connector_metadata():
+    base = make_empty_encoder_model_runner_output(
+        _make_scheduler_output({"req-z": 2, "req-a": 4})
+    )
+    ec_output = ECConnectorOutput(finished_sending={"mm-hash"})
+
+    result = ModelRunnerOutput.with_ec_conn_output(base, ec_output)
+
+    assert result is base
+    assert result.ec_connector_output is ec_output
+    assert result.req_ids == ["req-z", "req-a"]
+    assert result.req_id_to_index == {"req-z": 0, "req-a": 1}
+    assert result.sampled_token_ids == []
+    assert result.pooler_output is None
